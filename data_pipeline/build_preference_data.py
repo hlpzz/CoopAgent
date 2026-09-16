@@ -1,57 +1,34 @@
+import difflib
 import json
 import os
 import random
-from pathlib import Path
-from names import get_first_name
 import re
+from functools import lru_cache
+from pathlib import Path
+from typing import Dict, List, Tuple
+
 from openai import OpenAI
-from .perturbation_prompts import NOISE_PROMPT, EDIT_NOISE_PROMPT, CREATE_NOISE_PROMPT
-import difflib
+
+from .prompt_templates import CREATE_NOISE_PROMPT, EDIT_NOISE_PROMPT, LANG_CHAIN_PROMPT
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-TMP_DIR = REPO_ROOT / "tmp"
+# Replace these path placeholders before running the pipeline.
+VILLAGERAGENT_ROOT = Path("path/to/VillagerAgent")
+BLOCKS_PATH = VILLAGERAGENT_ROOT / "data" / "blocks.json"
+INPUT_DATA_PATH = Path("path/to/trajectory_data.json")
+OUTPUT_DATA_PATH = Path("path/to/preference_dataset.json")
+NOISE_CACHE_PATH = Path("path/to/noise_cache.json")
 
-LANG_CHAIN_PROMPT = '''System: Respond to the human as helpfully and accurately as possible. You have access to the following tools:
+# OpenAI-compatible API configuration. The API key is read from the environment.
+API_KEY_ENV_VAR = "DASHSCOPE_API_KEY"
+API_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+PERTURBATION_MODEL = "qwen3-next-80b-a3b-instruct"
 
-{{tool_list}}
-
-Use a json blob to specify a tool by providing an action key (tool name) and an action_input key (tool input).
-
-Valid "action" values: "Final Answer" or {{tool_order}}
-
-Provide only ONE action per $JSON_BLOB, as shown:
-
-```
-{
-  "action": $TOOL_NAME,
-  "action_input": $INPUT
-}
-```
-
-Follow this format:
-
-Question: input question to answer
-Thought: consider previous and subsequent steps
-Action:
-```
-$JSON_BLOB
-```
-Observation: action result
-... (repeat Thought/Action/Observation N times)
-Thought: I know what to respond
-Action:
-```
-{
-  "action": "Final Answer",
-  "action_input": "Final response to human"
-}
-```
-
-Begin! Reminder to ALWAYS respond with a valid json blob of a single action. Use tools if necessary. Respond directly if appropriate. Format is Action:```$JSON_BLOB```then Observation:.
-Thought:
-Human: 
-'''
+PERTURBATION_MODE = "task_related"  # "task_related" or "random"
+CACHE_SAVE_INTERVAL = 5
+MIN_PROMPT_SIMILARITY = 0.96
+MAX_PROMPT_SIMILARITY = 0.9997
+MAX_PERTURBATION_RETRIES = 10
 
 TOOL_LIST = '''eat: eat(player_name: str, item_name: str, emotion: list, murmur: str) - Eat Item, args: {'player_name': {'title': 'Player Name', 'type': 'string'}, 'item_name': {'title': 'Item Name', 'type': 'string'}, 'emotion': {'title': 'Emotion', 'type': 'array', 'items': {}}, 'murmur': {'title': 'Murmur', 'type': 'string'}}
 talkTo: talkTo(player_name: str, entity_name: str, message: str, emotion: list = ['😊']) - Talk to the Entity with Emojis, entity_name is the name of other player., args: {'player_name': {'title': 'Player Name', 'type': 'string'}, 'entity_name': {'title': 'Entity Name', 'type': 'string'}, 'message': {'title': 'Message', 'type': 'string'}, 'emotion': {'title': 'Emotion', 'default': ['😊'], 'type': 'array', 'items': {}}}
@@ -112,173 +89,172 @@ specialize_tool = {
 def string_similarity(a: str, b: str) -> float:
     """
     Compare the similarity between two strings using Levenshtein-like ratio.
-    
+
     Returns:
         float: similarity score between 0.0 and 1.0
     """
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
-def get_client():
-    api_key = os.getenv("DASHSCOPE_API_KEY")
+@lru_cache(maxsize=1)
+def get_client() -> OpenAI:
+    api_key = os.getenv(API_KEY_ENV_VAR)
     if not api_key:
-        raise RuntimeError("Set DASHSCOPE_API_KEY before generating perturbations.")
+        raise RuntimeError(f"Set {API_KEY_ENV_VAR} before generating perturbations.")
 
     return OpenAI(
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        base_url=API_BASE_URL,
         api_key=api_key,
     )
 
 
-def write_debug_pair(original_prompt: str, perturbed_prompt: str):
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
-    (TMP_DIR / "orig_output.txt").write_text(original_prompt, encoding="utf-8")
-    (TMP_DIR / "output.txt").write_text(perturbed_prompt, encoding="utf-8")
-
-'''
-{
-  "noise_type": "add" | "remove",
-  "target_coordinate": [x, y, z],
-  "noise_coordinate": [tx, ty, tz],   // only required if noise_type="add"
-  "noise_block": "grass_block" | "dirt" | <block_from_task>
-}
-'''
-
-def random_noise():
-    villageragent_root = os.getenv("VILLAGERAGENT_ROOT")
-    if not villageragent_root:
-        raise RuntimeError(
-            "Set VILLAGERAGENT_ROOT to the local VillagerAgent repository."
-        )
-
-    blocks_path = Path(villageragent_root) / "data" / "blocks.json"
-    with blocks_path.open("r", encoding="utf-8") as f:
+def random_noise() -> dict:
+    with BLOCKS_PATH.open("r", encoding="utf-8") as f:
         block_list = json.load(f)
     noise_block = random.choice(block_list)["name"]
     noise_json = {
         "noise_type": "add",
-        "noise_coordinate": [random.randint(0, 25), random.randint(-61, -57),random.randint(0, 25)],
-        "noise_block": noise_block
+        "noise_coordinate": [
+            random.randint(0, 25),
+            random.randint(-61, -57),
+            random.randint(0, 25),
+        ],
+        "noise_block": noise_block,
     }
     return noise_json
 
 
-
-def step1_generate_noise(orig_prompt: str):
+def step1_generate_noise(orig_prompt: str) -> str:
     noise_type = random.choices(["add", "remove"], [4, 1])[0]
     prompt = format_string(CREATE_NOISE_PROMPT, {"orig_prompt": orig_prompt, "noise_type": noise_type})
     res = get_client().chat.completions.create(
-        model="qwen3-next-80b-a3b-instruct",
-        # model="qwen3-max",
+        model=PERTURBATION_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.8,
-        top_p=0.9
+        top_p=0.9,
     )
     return res.choices[0].message.content
 
-def step2_apply_noise(orig_prompt: str, noise_json: str):
+
+def step2_apply_noise(orig_prompt: str, noise_json: str) -> str:
     prompt = format_string(EDIT_NOISE_PROMPT, {"orig_prompt": orig_prompt, "noise_json": noise_json})
     res = get_client().chat.completions.create(
-        model="qwen3-next-80b-a3b-instruct",
-        # model="qwen3-max",
+        model=PERTURBATION_MODEL,
         messages=[{"role": "user", "content": prompt}],
     )
 
     return res.choices[0].message.content
 
-def add_noise(orig_prompt: str):
-    # noise_json = step1_generate_noise(orig_prompt)      # TASK RELATED NOISE
-    noise_json = random_noise()    # RANDOM NOISE
-    noise_str = json.dumps(noise_json)
-    # with (TMP_DIR / "dict_format.json").open("w", encoding="utf-8") as f:
-    #     json.dump(noise_str, f, indent=4)
-    noisy_prompt = step2_apply_noise(orig_prompt, noise_str)
-    return noisy_prompt
+
+def add_noise(orig_prompt: str) -> str:
+    if PERTURBATION_MODE == "task_related":
+        noise_json = step1_generate_noise(orig_prompt)
+    elif PERTURBATION_MODE == "random":
+        noise_json = json.dumps(random_noise(), ensure_ascii=False)
+    else:
+        raise ValueError(
+            f"Unsupported PERTURBATION_MODE={PERTURBATION_MODE!r}; "
+            "expected 'task_related' or 'random'."
+        )
+
+    return step2_apply_noise(orig_prompt, noise_json)
 
 
-def shuffle_tool_list():
-    # 分割原始字符串为单独的工具行
+def shuffle_tool_list() -> Tuple[str, str]:
+    # Split the tool description into individual entries.
     tool_lines = [line.strip() for line in TOOL_LIST.split('\n') if line.strip()]
-    
-    # 提取工具名称和完整行
+
+    # Retain both the tool name and its complete description.
     tools = []
     for line in tool_lines:
-        # 获取工具名称（第一个冒号前的部分）
         tool_name = line.split(':', 1)[0].strip()
         tools.append((tool_name, line))
-    
-    # 随机打乱工具顺序
+
     random.shuffle(tools)
-    
-    # 构建新的TOOL_LIST字符串和工具名称列表
+
     shuffled_tool_list = '\n'.join([tool[1] for tool in tools])
     shuffled_order = ', '.join([tool[0] for tool in tools])
-    
+
     return shuffled_tool_list, shuffled_order
 
-
-
 def format_string(template: str, data: dict) -> str:
-    # 检查template中的{{}}是否都在data中
     keys = re.findall(r'{{(.*?)}}', template)
     for key in keys:
         if key not in data:
-            raise ValueError(f'when format:\n{template} \nkey {key} not found in data')
+            raise ValueError(f"Missing template value for {key!r}.")
 
-    # 替换{{}}为data中的值
     for key, value in data.items():
         template = template.replace('{{' + key + '}}', str(value))
     return template
 
-def dpo_convert(new_name_files):
+
+def load_noise_cache() -> List[str]:
+    if not NOISE_CACHE_PATH.exists():
+        return []
+
+    with NOISE_CACHE_PATH.open("r", encoding="utf-8") as f:
+        noise_cache = json.load(f)
+    if not isinstance(noise_cache, list):
+        raise ValueError(f"Noise cache must be a JSON list: {NOISE_CACHE_PATH}")
+    return noise_cache
+
+
+def save_noise_cache(noise_cache: List[str]) -> None:
+    NOISE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with NOISE_CACHE_PATH.open("w", encoding="utf-8") as f:
+        json.dump(noise_cache, f, indent=2, ensure_ascii=False)
+
+
+def build_preference_records(trajectories: List[Dict]) -> List[Dict]:
     final_dataset = []
     t = 0
-    with open ("temp_random_noise.json", "r", encoding='utf-8') as f:
-    # with open ("temp_noise.json", "r", encoding='utf-8') as f:
-        noise_temp = json.load(f)
-    for task in new_name_files:
+    noise_cache = load_noise_cache()
+    cache_changed = False
+
+    for task in trajectories:
         task_list = task["action"]
         config = task["config"]
         for chain in task_list:
-            input_, action_list, final_answer = chain['input'], chain['action_list'], chain['final_answer']
-            fail_noise = False
-            if t < len(noise_temp):
-                noise_input = noise_temp[t]
-                if abs(len(noise_input) - len(input_)) < 5:
-                    fail_noise = True
-            if t >= len(noise_temp) or fail_noise:
-                noise_input = add_noise(input_)
+            input_, action_list = chain['input'], chain['action_list']
+            regenerate_noise = t >= len(noise_cache)
+            if not regenerate_noise:
+                noise_input = noise_cache[t]
+                regenerate_noise = (
+                    not isinstance(noise_input, str)
+                    or abs(len(noise_input) - len(input_)) < 5
+                )
 
-                # output_txt = input_ + "=" * 120 + noise_input
-                # with (TMP_DIR / "output.txt").open("w", encoding="utf-8") as f:
-                #     f.write(output_txt)
-                # print("ok")
-                # while 1:
-                #     pass
+            if regenerate_noise:
+                noise_input = add_noise(input_)
                 similarity = string_similarity(input_, noise_input)
                 retry_time = 0
-                while similarity > 0.9997 or similarity < 0.96:
-                    if similarity > 0.9997:
-                        write_debug_pair(input_, noise_input)
-                    print(f"{t}: {similarity} -- retry")
+                while similarity > MAX_PROMPT_SIMILARITY or similarity < MIN_PROMPT_SIMILARITY:
                     retry_time += 1
-                    if retry_time >= 10:
+                    if retry_time >= MAX_PERTURBATION_RETRIES:
                         raise RuntimeError(f"Too many retries at t={t}, similarity={similarity}")
                     noise_input = add_noise(input_)
                     similarity = string_similarity(input_, noise_input)
-                print(f"{t}: {similarity}")
-                noise_temp.append(noise_input)
-                if t % 5 == 0:
-                # if t == 1409:
-                    with open("temp_random_noise.json", "w", encoding='utf-8') as f:
-                    # with open("temp_noise.json", "w", encoding='utf-8') as f:
-                        json.dump(noise_temp, f ,indent=4)
+
+                if t < len(noise_cache):
+                    noise_cache[t] = noise_input
+                else:
+                    noise_cache.append(noise_input)
+                cache_changed = True
+
+                if (t + 1) % CACHE_SAVE_INTERVAL == 0:
+                    save_noise_cache(noise_cache)
+                    cache_changed = False
 
             t += 1
 
             shuffled_tool_list, shuffled_order = shuffle_tool_list()
-            input_str = format_string(LANG_CHAIN_PROMPT, {"tool_list": shuffled_tool_list, "tool_order": shuffled_order}) + chain["input"]
-            noise_str = format_string(LANG_CHAIN_PROMPT, {"tool_list": shuffled_tool_list, "tool_order": shuffled_order}) + noise_input
+            prompt_values = {
+                "tool_list": shuffled_tool_list,
+                "tool_order": shuffled_order,
+            }
+            prompt_prefix = format_string(LANG_CHAIN_PROMPT, prompt_values)
+            input_str = prompt_prefix + chain["input"]
+            noise_str = prompt_prefix + noise_input
             chain_len = len(action_list)
             tag = []
             first_action = True
@@ -291,7 +267,7 @@ def dpo_convert(new_name_files):
                 tag.append((tool_used in universe_tool or tool_used in specialize_tool[task_type]) and status)
             for i in range(chain_len):
                 action = action_list[i]
-                if not tag[i]: # lose action
+                if not tag[i]:  # Rejected action
                     win_found = False
                     for j in range(i+1, chain_len):
                         if tag[j]:
@@ -322,33 +298,25 @@ def dpo_convert(new_name_files):
                 if first_action:
                     input_str += "\n\nThis was your previous work (but I haven't seen any of it! I only see what you return as final answer):\n"
                     noise_str += "\n\nThis was your previous work (but I haven't seen any of it! I only see what you return as final answer):\n"
-                    first_action =  False
+                    first_action = False
                 input_str += action["action"]["log"] + "\n"
                 noise_str += action["action"]["log"] + "\n"
-                
+
                 input_str += "Observation: " + str(action["feedback"])  + "\nThought:"
                 noise_str += "Observation: " + str(action["feedback"])  + "\nThought:"
 
+    if cache_changed:
+        save_noise_cache(noise_cache)
+
     return final_dataset
 
-def test(new_name_files):
-    for task in new_name_files:
-        task_list = task["action"]
-        config = task["config"]
-        for chain in task_list:
-            input_, action_list, final_answer = chain['input'], chain['action_list'], chain['final_answer']
-            noise_input = add_noise(input_)
-            
-            write_debug_pair(input_, noise_input)
-            print(string_similarity(input_, noise_input))
-            
-            return
 
 if __name__ == "__main__":
-    with open("temp_output.json", "r", encoding='utf-8') as f:
-        new_name_files = json.load(f)
-    final_dataset = dpo_convert(new_name_files)
-    with open("random_noise_dpo_dataset.json", "w", encoding='utf-8') as f:
-        json.dump(final_dataset, f, indent=4)
-    print(len(final_dataset))
-    # test(new_name_files)
+    with INPUT_DATA_PATH.open("r", encoding="utf-8") as f:
+        trajectories = json.load(f)
+
+    final_dataset = build_preference_records(trajectories)
+    OUTPUT_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with OUTPUT_DATA_PATH.open("w", encoding="utf-8") as f:
+        json.dump(final_dataset, f, indent=2, ensure_ascii=False)
+    print(f"Wrote {len(final_dataset)} preference pairs to {OUTPUT_DATA_PATH}")

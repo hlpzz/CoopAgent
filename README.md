@@ -1,146 +1,177 @@
 # CoopAgent
 
-CoopAgent is a two-stage training framework for improving multi-agent cooperation using only single-agent execution trajectories. It first learns atomic agent behavior through LoRA supervised fine-tuning (SFT), then applies Perturbation-Aligned Direct Preference Optimization (PADPO) to keep action preferences stable under task-related observation changes.
+**CoopAgent: Training Multi-Agent Cooperation from Single-Agent Execution Trajectories** (EMNLP 2026)
 
-This repository contains only the CoopAgent data-construction and training code. Minecraft execution, atomic-task generation, trajectory collection, and evaluation are provided by the external VillagerAgent/VillagerBench environment.
+CoopAgent learns multi-agent cooperation from successful single-agent atomic-task trajectories. Training consists of supervised fine-tuning (SFT), followed by Perturbation-Aligned Direct Preference Optimization (PADPO).
 
-## Repository layout
+This repository contains the data-construction and training code. Minecraft task generation and trajectory collection rely on [VillagerAgent/VillagerBench](https://github.com/cnsdqd-dyb/VillagerAgent-Minecraft-multiagent-framework).
+
+## Repository structure
 
 ```text
 CoopAgent/
-├── data_pipeline/
-│   ├── augment_preference_data.py
-│   ├── build_training_data.py
-│   └── perturbation_prompts.py
-├── training/
-│   ├── padpo_trainer.py
-│   ├── train_padpo_qwen2_5.py
-│   └── train_sft_qwen2_5.py
-├── docs/
-│   ├── DATA_PIPELINE.md
-│   └── KNOWN_RISKS.md
-└── requirements.txt
+|-- data_pipeline/
+|   |-- build_sft_data.py
+|   |-- build_preference_data.py
+|   `-- prompt_templates.py
+|-- training/
+|   |-- train_sft.py
+|   |-- train_padpo.py
+|   `-- padpo_trainer.py
+|-- requirements.txt
+`-- README.md
 ```
-
-## Installation boundary
-
-CoopAgent intentionally does not vendor VillagerAgent or VillagerBench. There are two separate setup steps:
-
-1. Install VillagerAgent/VillagerBench to create Minecraft tasks and collect trajectories.
-2. Install this repository's Python dependencies to construct datasets and train CoopAgent.
-
-The local compatibility audit for this release used VillagerAgent commit `7edb5c6659f3ab02f850844ca78d5761a85dff5e`. Pin this revision until compatibility with a newer revision has been verified.
 
 ## Quickstart
 
-### 1. Install VillagerAgent/VillagerBench
+The workflow has two stages: collect trajectories and construct datasets, then run SFT and PADPO training. Separate Python environments are recommended for VillagerAgent and CoopAgent.
 
-Follow the upstream [VillagerAgent repository](https://github.com/cnsdqd-dyb/VillagerAgent-Minecraft-multiagent-framework) first. Its setup includes:
+### 1. Generate single-agent trajectories
 
-- Python 3.8 or newer;
-- Node.js and npm;
-- a reachable Minecraft 1.19.2 server;
-- the upstream Python and npm dependencies;
-- `npm install` and `python js_setup.py`;
-- an `API_KEY_LIST` file in the VillagerAgent root, as required by its Quickstart.
-
-For a pinned checkout:
+First, clone VillagerAgent and complete its environment, Minecraft 1.19.2 server, and API setup. Verify that its Quickstart works before continuing.
 
 ```bash
 git clone https://github.com/cnsdqd-dyb/VillagerAgent-Minecraft-multiagent-framework.git
 cd VillagerAgent-Minecraft-multiagent-framework
-git checkout 7edb5c6659f3ab02f850844ca78d5761a85dff5e
+
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 npm install
 python js_setup.py
 ```
 
-Start the Minecraft server and verify the upstream minimal example before continuing. CoopAgent does not replace or diagnose the Minecraft-side setup.
+Use the activation command appropriate for your operating system. VillagerAgent also requires Node.js, Java, a reachable Minecraft server, and suitable player permissions.
 
-### 2. Install CoopAgent dependencies
+Create `API_KEY_LIST` in the VillagerAgent root:
 
-From the CoopAgent repository root:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+```json
+{
+  "AGENT_KEY": ["your_api_key_here"]
+}
 ```
 
-On Windows PowerShell, activate the environment with:
+Do not commit this file. If necessary, update the API endpoint and model settings in VillagerAgent's `config.py` and `start_with_config.py`.
 
-```powershell
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-### 3. Configure the data pipeline
-
-The data pipeline needs the installed VillagerAgent repository and an API key for perturbation generation. The same DashScope/Qwen key may be used for VillagerAgent and CoopAgent, but CoopAgent reads it from an environment variable rather than from a tracked file.
-
-Linux or macOS:
-
-```bash
-export VILLAGERAGENT_ROOT=/absolute/path/to/VillagerAgent-Minecraft-multiagent-framework
-export DASHSCOPE_API_KEY=your_key_here
-```
-
-Windows PowerShell:
-
-```powershell
-$env:VILLAGERAGENT_ROOT = "C:\path\to\VillagerAgent-Minecraft-multiagent-framework"
-$env:DASHSCOPE_API_KEY = "your_key_here"
-```
-
-Never commit either the upstream `API_KEY_LIST` file or a local `.env` file.
-
-### 4. Generate and execute single-agent atomic tasks
-
-Run task generation from the VillagerAgent root:
+Generate single-agent meta-task configurations:
 
 ```bash
 python config.py \
   --task meta \
   --meta_task_num 1000 \
   --api_model qwen3-next-80b-a3b-instruct \
-  --host localhost \
+  --host 127.0.0.1 \
   --port 25565 \
   --agent_num 1
 ```
 
-This creates a launch-config JSON file. Set `CONFIG_PATH` near the top of VillagerAgent's `start_with_config.py` to that file, then execute:
+Adjust the model, task count, host, and port as needed. The example creates:
+
+```text
+qwen3_next_80b_a3b_instruct_launch_config_meta.json
+```
+
+Set the launch-configuration path in `start_with_config.py` to the generated JSON file, then run:
 
 ```bash
 python start_with_config.py
 ```
 
-Completed runs are written under VillagerAgent's `result/<task_name>/` directories. CoopAgent expects each usable run to contain at least:
+Results are written under `result/<task_name>/`. The SFT builder retains tasks with `score.json`, `Alice_history.json`, and `config.json` whose numeric score is at least `50`.
 
-- `score.json`;
-- `Alice_history.json`;
-- `config.json`.
+### 2. Construct the SFT and PADPO datasets
 
-See [docs/DATA_PIPELINE.md](docs/DATA_PIPELINE.md) for the dataset schemas and the current execution constraints.
-
-### 5. Train CoopAgent
-
-The training scripts are lightweight wrappers around Transformers, PEFT, and TRL. The current revision still stores model, dataset, adapter, and output paths as constants inside the scripts. Update those paths before execution.
-
-Stage 1, LoRA SFT:
+Create a separate environment for this repository:
 
 ```bash
-python -m training.train_sft_qwen2_5
+git clone https://github.com/hlpzz/CoopAgent.git
+cd CoopAgent
+
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-Stage 2, PADPO initialized from the SFT adapter:
+In `data_pipeline/build_sft_data.py`, set:
+
+```python
+RESULTS_DIR = Path("/path/to/VillagerAgent-Minecraft-multiagent-framework/result")
+SFT_OUTPUT_PATH = Path("/path/to/CoopAgent/outputs/sft_dataset.json")
+TRAJECTORY_OUTPUT_PATH = Path("/path/to/CoopAgent/outputs/trajectory_data.json")
+```
+
+Then build the SFT data and processed trajectories:
 
 ```bash
-python -m training.train_padpo_qwen2_5
+python -m data_pipeline.build_sft_data
 ```
 
-The training scripts were originally executed on a GPU server and are not expected to run on a typical local machine without adapting the model paths, CUDA environment, and distributed-training configuration.
+Next, configure `data_pipeline/build_preference_data.py`:
 
-## Current status
+```python
+VILLAGERAGENT_ROOT = Path("/path/to/VillagerAgent-Minecraft-multiagent-framework")
+INPUT_DATA_PATH = Path("/path/to/CoopAgent/outputs/trajectory_data.json")
+OUTPUT_DATA_PATH = Path("/path/to/CoopAgent/outputs/preference_dataset.json")
+NOISE_CACHE_PATH = Path("/path/to/CoopAgent/outputs/noise_cache.json")
 
-The repository structure and import paths have been cleaned, but the command-line interfaces and paper-exact data flow are still being consolidated. Read [docs/KNOWN_RISKS.md](docs/KNOWN_RISKS.md) before treating this revision as reproducible release code.
+API_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+PERTURBATION_MODEL = "qwen3-next-80b-a3b-instruct"
+PERTURBATION_MODE = "task_related"
+```
 
+`task_related` is used by the main method; `random` is retained for the random-perturbation ablation and reads `data/blocks.json` from VillagerAgent.
+
+Set the API key and build the preference data:
+
+```bash
+export DASHSCOPE_API_KEY=your_api_key_here
+python -m data_pipeline.build_preference_data
+```
+
+The output contains `prompt`, `noise_prompt`, `chosen`, and `rejected`. Generated perturbations are cached at `NOISE_CACHE_PATH`, allowing interrupted runs to resume without repeating completed API calls.
+
+### 3. Train CoopAgent
+
+Prepare a Hugging Face causal language model. A local model directory must include its weights, configuration, and tokenizer files. Use the same base model for both training stages.
+
+For SFT, set these values in `training/train_sft.py`:
+
+```python
+MODEL_PATH = "path/to/base_model_or_huggingface_model_id"
+TRAIN_DATA_PATH = "path/to/sft_dataset.json"
+OUTPUT_DIR = "path/to/sft_output"
+```
+
+Run:
+
+```bash
+python -m training.train_sft
+```
+
+For PADPO, set these values in `training/train_padpo.py`:
+
+```python
+MODEL_PATH = "path/to/the_same_base_model"
+ADAPTER_PATH = "path/to/sft_output/checkpoint-N"
+TRAIN_DATA_PATH = "path/to/preference_dataset.json"
+OUTPUT_DIR = "path/to/padpo_output"
+```
+
+`ADAPTER_PATH` must point to the SFT LoRA checkpoint containing `adapter_config.json`. Run:
+
+```bash
+python -m training.train_padpo
+```
+
+For multi-GPU training, replace either command with, for example:
+
+```bash
+torchrun --nproc_per_node=8 -m training.train_sft
+torchrun --nproc_per_node=8 -m training.train_padpo
+```
+
+Adjust batch size, sequence length, precision, distributed settings, and `save_steps` for your hardware and dataset size.
+
+## Acknowledgements
+
+CoopAgent builds on [VillagerAgent/VillagerBench](https://github.com/cnsdqd-dyb/VillagerAgent-Minecraft-multiagent-framework) for Minecraft task generation, environment execution, and evaluation.

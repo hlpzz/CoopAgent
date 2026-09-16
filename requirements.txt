@@ -1,10 +1,10 @@
 # CoopAgent-specific dependencies. VillagerAgent/VillagerBench must be installed separately.
-torch
-transformers
+torch==2.8.0
+transformers==4.57.3
 datasets
-peft
-trl
-accelerate
+peft==0.18.0
+trl==0.23.1
+accelerate==1.12.0
 bitsandbytes
 openai
 names

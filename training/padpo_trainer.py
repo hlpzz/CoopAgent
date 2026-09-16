@@ -37,7 +37,7 @@ class CustomDPOTrainer(DPOTrainer):
         else:
             self.padding_value = 0
         
-        # 🔴 只添加attention_mask，不做其他修改
+        # 只添加attention_mask，不做其他修改
         self._add_attention_masks_only()
         
         self.regularization_weight = regularization_weight
@@ -91,9 +91,9 @@ class CustomDPOTrainer(DPOTrainer):
                 batched=True,
                 desc="Adding attention masks",
             )
-            print(f"✅ attention_mask添加完成")
+            print(f"attention_mask添加完成")
         else:
-            print(f"✅ attention_mask已存在，跳过")
+            print(f"attention_mask已存在，跳过")
         
         print("="*80 + "\n")
     
@@ -185,7 +185,6 @@ class CustomDPOTrainer(DPOTrainer):
                 
             else:
                 base = model.module if hasattr(model, "module") else model
-                # ✅ 正确做法：临时禁用adapter获取base model输出
                 with base.disable_adapter():
                     ref_forward_output = self.concatenated_forward(base, batch)
                 
@@ -240,7 +239,7 @@ class CustomDPOTrainer(DPOTrainer):
             del noise_forward_output, noise_batch
             torch.cuda.empty_cache()
             
-            # 🔴 计算advantage
+            # 计算advantage
             advantage_original = (policy_chosen_logps - policy_rejected_logps).detach()
             advantage_noise = noise_chosen_logps - noise_rejected_logps
             
@@ -293,14 +292,14 @@ class CustomDPOTrainer(DPOTrainer):
         noise_batch = {
             "prompt_input_ids": batch["noise_prompt_input_ids"],  # noise作为新的prompt
             "prompt_attention_mask": batch["noise_prompt_attention_mask"],
-            # 🔴 chosen/rejected仍然只是response部分，不包含prompt
+            # chosen/rejected仍然只是response部分，不包含prompt
             "chosen_input_ids": batch["chosen_input_ids"],  # 已经是response-only
             "chosen_attention_mask": batch["chosen_attention_mask"],
             "rejected_input_ids": batch["rejected_input_ids"],
             "rejected_attention_mask": batch["rejected_attention_mask"],
         }
         
-        # 🔴 不需要手动拼接，concatenated_forward会处理
+        # 不需要手动拼接，concatenated_forward会处理
         
         return noise_batch
 

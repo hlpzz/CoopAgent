@@ -1,25 +1,47 @@
-NOISE_PROMPT = '''
-Use the RANDOM_SEED value as high-level randomness to produce different noise every time.
-You are a noise injector responsible for adding perturbations to a given prompt. You will receive a prompt intended for an Agent performing tasks in the game Minecraft. This prompt contains information about the task, the agent state, and the environment. Your job is to precisely identify the section that describes the environment information, and inject noise into that section only, while keeping all other parts of the original prompt exactly as they are.
-The noise must be added according to the following rules:
-
-1. Identify the block entities that the task may involve (if none can be found, default to “dirt”). Then randomly select one block **B** from the set {“grass_block”, “dirt”, the blocks you identified}.
-2. The environment information includes coordinates of certain blocks. Select one of these coordinates, and choose a nearby coordinate **t** within ±2 blocks of it.
-3. Insert the following sentence into the original environment description:
-   **“There is a block B at coordinate t.”**
-
-Keep all other content unchanged and return only the prompt with the injected noise.
-
-*** Important Notice ***
-1. Ensure the chosen coordinate **t** is not far from the coordinates originally provided.
-2. The inserted noise must appear within the environment description section, and the writing style must match that of the original prompt.
-3. Aside from inserting the noise, do not alter any other characters—no additions, deletions, or modifications.
-4. Output only the original prompt with the injected noise, and nothing else.
-
-The original prompt is as below:
+"""Prompt templates used by the CoopAgent data builders."""
 
 
+LANG_CHAIN_PROMPT = '''System: Respond to the human as helpfully and accurately as possible. You have access to the following tools:
+
+{{tool_list}}
+
+Use a json blob to specify a tool by providing an action key (tool name) and an action_input key (tool input).
+
+Valid "action" values: "Final Answer" or {{tool_order}}
+
+Provide only ONE action per $JSON_BLOB, as shown:
+
+```
+{
+  "action": $TOOL_NAME,
+  "action_input": $INPUT
+}
+```
+
+Follow this format:
+
+Question: input question to answer
+Thought: consider previous and subsequent steps
+Action:
+```
+$JSON_BLOB
+```
+Observation: action result
+... (repeat Thought/Action/Observation N times)
+Thought: I know what to respond
+Action:
+```
+{
+  "action": "Final Answer",
+  "action_input": "Final response to human"
+}
+```
+
+Begin! Reminder to ALWAYS respond with a valid json blob of a single action. Use tools if necessary. Respond directly if appropriate. Format is Action:```$JSON_BLOB```then Observation:.
+Thought:
+Human:
 '''
+
 
 CREATE_NOISE_PROMPT = '''
 You are a noise generator for Minecraft task prompts.
@@ -44,9 +66,9 @@ Rules:
 1. Identify all block types involved in the task. If none exist, use "dirt".
 2. Identify all coordinates mentioned in the environment info.
 3. Randomly choose one coordinate as the target.
-4. If noise_type="add": 
+4. If noise_type="add":
       Create a nearby coordinate (within ±2 blocks) and select a noise_block.
-5. If noise_type="remove": 
+5. If noise_type="remove":
       The target coordinate represents the block to be removed.
 6. Your output MUST be ONLY the JSON object, with no explanation.
 7. Ensure that the generated noise does not interfere with task execution.
